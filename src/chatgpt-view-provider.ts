@@ -1,16 +1,3 @@
-/**
- * @author Ali Gençay
- * https://github.com/gencay/vscode-chatgpt
- *
- * @license
- * Copyright (c) 2022 - Present, Ali Gençay
- *
- * All rights reserved. Code licensed under the ISC license
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- */
-
 import delay from 'delay';
 import fetch from 'isomorphic-fetch';
 import * as fs from 'node:fs';
@@ -87,10 +74,15 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 				case 'addFreeTextQuestion':
 					this.sendApiRequest(data.value, { command: "freeText" });
 					break;
+				case 'addGuidanceQuestion':
+					this.sendApiRequestv2(data.value, { command: "freeText" });
+					break;
+				case 'startGuiding':
+					this.sendApiRequestv3(data.value, { command: "freeText" });
+					break;
 				case 'editCode':
 					const escapedString = (data.value as string).replace(/\$/g, '\\$');;
 					vscode.window.activeTextEditor?.insertSnippet(new vscode.SnippetString(escapedString));
-
 					this.logEvent("code-inserted");
 					break;
 				case 'openNew':
@@ -105,7 +97,6 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 				case 'clearConversation':
 					this.messageId = undefined;
 					this.conversationId = undefined;
-
 					this.logEvent("conversation-cleared");
 					break;
 				case 'clearBrowser':
@@ -309,7 +300,10 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private get systemContext() {
-		return `You are ChatGPT helping the User with pair programming.`;
+		// return `You are ChatGPT helping the User with pair programming.`;
+		return `
+			You are an experienced data scientist named Sarah, specializing in Jupyter Notebook. Your role is to expertly guide users in creating their notebooks, providing step-by-step assistance while carefully following their instructions to ensure a smooth and successful notebook creation process. When working with Jupyter Notebook, observation plays a huge role. Thus, always ask the user for more information if the information they provided is too vague.
+		`;
 	}
 
 	private processQuestion(question: string, code?: string, language?: string) {
@@ -320,7 +314,11 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 		return question + "\r\n";
 	}
 
+	// Send API Request v1 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 	public async sendApiRequest(prompt: string, options: { command: string, code?: string, previousAnswer?: string, language?: string; }) {
+		let addon = `
+		
+		`;
 		if (this.inProgress) {
 			// The AI is still thinking... Do not accept more questions.
 			return;
@@ -349,7 +347,6 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 		this.abortController = new AbortController();
 		this.sendMessage({ type: 'showInProgress', inProgress: this.inProgress, showStopButton: this.useGpt3 });
 		this.currentMessageId = this.getRandomId();
-
 		this.sendMessage({ type: 'addQuestion', value: prompt, code: options.code, autoScroll: this.autoScroll });
 
 		try {
@@ -386,15 +383,15 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 
 			const hasContinuation = ((this.response.split("```").length) % 2) === 1;
 
-			if (hasContinuation) {
-				this.response = this.response + " \r\n ```\r\n";
-				vscode.window.showInformationMessage("It looks like ChatGPT didn't complete their answer for your coding question. You can ask it to continue and combine the answers.", "Continue and combine answers")
-					.then(async (choice) => {
-						if (choice === "Continue and combine answers") {
-							this.sendApiRequest("Continue", { command: options.command, code: undefined, previousAnswer: this.response });
-						}
-					});
-			}
+			/*if (hasContinuation) {
+			this.response = this.response + " \r\n ```\r\n";
+			vscode.window.showInformationMessage("It looks like ChatGPT didn't complete their answer for your coding question. You can ask it to continue and combine the answers.", "Continue and combine answers")
+				.then(async (choice) => {
+					if (choice === "Continue and combine answers") {
+						this.sendApiRequest("Continue", { command: options.command, code: undefined, previousAnswer: this.response });
+					}
+				});
+			} */
 
 			this.sendMessage({ type: 'addResponse', value: this.response, done: true, id: this.currentMessageId, autoScroll: this.autoScroll, responseInMarkdown });
 
@@ -435,14 +432,255 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 			}
 
 			if (apiMessage) {
-				message = `${message ? message + " " : ""}
+				message = `${message ? message + " " : ""}${apiMessage}`;
+			}
+			this.sendMessage({ type: 'addError', value: message, autoScroll: this.autoScroll });
+			return;
+		} finally {
+			this.inProgress = false;
+			this.sendMessage({ type: 'showInProgress', inProgress: this.inProgress });
+		}
+	}
 
-	${apiMessage}
-`;
+	// Send API Request v2 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	public async sendApiRequestv2(prompt: string, options: { command: string, code?: string, previousAnswer?: string, language?: string; }) {
+		if (this.inProgress) {
+			// The AI is still thinking... Do not accept more questions.
+			return;
+		}
+
+		this.questionCounter++;
+
+		this.logEvent("api-request-sent", { "chatgpt.command": options.command, "chatgpt.hasCode": String(!!options.code), "chatgpt.hasPreviousAnswer": String(!!options.previousAnswer) });
+
+		if (!await this.prepareConversation()) {
+			return;
+		}
+
+		this.response = '';
+		let question = this.processQuestion(prompt, options.code, options.language);
+		const responseInMarkdown = !this.isCodexModel;
+
+		// If the ChatGPT view is not in focus/visible; focus on it to render Q&A
+		if (this.webView == null) {
+			vscode.commands.executeCommand('vscode-chatgpt.view.focus');
+		} else {
+			this.webView?.show?.(true);
+		}
+
+		this.inProgress = true;
+		this.abortController = new AbortController();
+		this.sendMessage({ type: 'showInProgress', inProgress: this.inProgress, showStopButton: this.useGpt3 });
+		this.currentMessageId = this.getRandomId();
+		try {
+			if (this.useGpt3) {
+				if (this.isGpt35Model && this.apiGpt35) {
+					const gpt3Response = await this.apiGpt35.sendMessage(question, {
+						systemMessage: this.systemContext,
+						messageId: this.conversationId,
+						parentMessageId: this.messageId,
+						abortSignal: this.abortController.signal,
+						onProgress: (partialResponse) => {
+							this.response = partialResponse.text;
+							this.sendMessage({ type: 'addResponsev2', value: this.response, id: this.conversationId, autoScroll: this.autoScroll, responseInMarkdown });
+						},
+					});
+					({ text: this.response, id: this.conversationId, parentMessageId: this.messageId } = gpt3Response);
+				} else if (!this.isGpt35Model && this.apiGpt3) {
+					({ text: this.response, conversationId: this.conversationId, parentMessageId: this.messageId } = await this.apiGpt3.sendMessage(question, {
+						promptPrefix: this.systemContext,
+						messageId: this.conversationId,
+						parentMessageId: this.messageId,
+						abortSignal: this.abortController.signal,
+						onProgress: (partialResponse) => {
+							this.response = partialResponse.text;
+							this.sendMessage({ type: 'addResponsev2', value: this.response, id: this.messageId, autoScroll: this.autoScroll, responseInMarkdown });
+						},
+					}));
+				}
 			}
 
-			this.sendMessage({ type: 'addError', value: message, autoScroll: this.autoScroll });
+			if (options.previousAnswer != null) {
+				this.response = options.previousAnswer + this.response;
+			}
 
+			const hasContinuation = ((this.response.split("```").length) % 2) === 1;
+
+			/*if (hasContinuation) {
+			this.response = this.response + " \r\n ```\r\n";
+			vscode.window.showInformationMessage("It looks like ChatGPT didn't complete their answer for your coding question. You can ask it to continue and combine the answers.", "Continue and combine answers")
+				.then(async (choice) => {
+					if (choice === "Continue and combine answers") {
+						this.sendApiRequest("Continue", { command: options.command, code: undefined, previousAnswer: this.response });
+					}
+				});
+			} */
+
+			this.sendMessage({ type: 'addResponsev2', value: this.response, done: true, id: this.currentMessageId, autoScroll: this.autoScroll, responseInMarkdown });
+
+			if (this.subscribeToResponse) {
+				vscode.window.showInformationMessage("ChatGPT responded to your question.", "Open conversation").then(async () => {
+					await vscode.commands.executeCommand('vscode-chatgpt.view.focus');
+				});
+			}
+		} catch (error: any) {
+			let message;
+			let apiMessage = error?.response?.data?.error?.message || error?.tostring?.() || error?.message || error?.name;
+
+			this.logError("api-request-failed");
+
+			if (error?.response?.status || error?.response?.statusText) {
+				message = `${error?.response?.status || ""} ${error?.response?.statusText || ""}`;
+
+				vscode.window.showErrorMessage("An error occured. If this is due to max_token you could try `ChatGPT: Clear Conversation` command and retry sending your prompt.", "Clear conversation and retry").then(async choice => {
+					if (choice === "Clear conversation and retry") {
+						await vscode.commands.executeCommand("vscode-chatgpt.clearConversation");
+						await delay(250);
+						this.sendApiRequest(prompt, { command: options.command, code: options.code });
+					}
+				});
+			} else if (error.statusCode === 400) {
+				message = `Your method: '${this.loginMethod}' and your model: '${this.model}' may be incompatible or one of your parameters is unknown. Reset your settings to default. (HTTP 400 Bad Request)`;
+
+			} else if (error.statusCode === 401) {
+				message = 'Make sure you are properly signed in. If you are using Browser Auto-login method, make sure the browser is open (You could refresh the browser tab manually if you face any issues, too). If you stored your API key in settings.json, make sure it is accurate. If you stored API key in session, you can reset it with `ChatGPT: Reset session` command. (HTTP 401 Unauthorized) Potential reasons: \r\n- 1.Invalid Authentication\r\n- 2.Incorrect API key provided.\r\n- 3.Incorrect Organization provided. \r\n See https://platform.openai.com/docs/guides/error-codes for more details.';
+			} else if (error.statusCode === 403) {
+				message = 'Your token has expired. Please try authenticating again. (HTTP 403 Forbidden)';
+			} else if (error.statusCode === 404) {
+				message = `Your method: '${this.loginMethod}' and your model: '${this.model}' may be incompatible or you may have exhausted your ChatGPT subscription allowance. (HTTP 404 Not Found)`;
+			} else if (error.statusCode === 429) {
+				message = "Too many requests try again later. (HTTP 429 Too Many Requests) Potential reasons: \r\n 1. You exceeded your current quota, please check your plan and billing details\r\n 2. You are sending requests too quickly \r\n 3. The engine is currently overloaded, please try again later. \r\n See https://platform.openai.com/docs/guides/error-codes for more details.";
+			} else if (error.statusCode === 500) {
+				message = "The server had an error while processing your request, please try again. (HTTP 500 Internal Server Error)\r\n See https://platform.openai.com/docs/guides/error-codes for more details.";
+			}
+
+			if (apiMessage) {
+				message = `${message ? message + " " : ""}${apiMessage}`;
+			}
+			this.sendMessage({ type: 'addError', value: message, autoScroll: this.autoScroll });
+			return;
+		} finally {
+			this.inProgress = false;
+			this.sendMessage({ type: 'showInProgress', inProgress: this.inProgress });
+		}
+	}
+
+	public async sendApiRequestv3(prompt: string, options: { command: string, code?: string, previousAnswer?: string, language?: string; }) {
+		if (this.inProgress) {
+			// The AI is still thinking... Do not accept more questions.
+			return;
+		}
+
+		this.questionCounter++;
+
+		this.logEvent("api-request-sent", { "chatgpt.command": options.command, "chatgpt.hasCode": String(!!options.code), "chatgpt.hasPreviousAnswer": String(!!options.previousAnswer) });
+
+		if (!await this.prepareConversation()) {
+			return;
+		}
+
+		this.response = '';
+		let question = this.processQuestion(prompt, options.code, options.language);
+		const responseInMarkdown = !this.isCodexModel;
+
+		// If the ChatGPT view is not in focus/visible; focus on it to render Q&A
+		if (this.webView == null) {
+			vscode.commands.executeCommand('vscode-chatgpt.view.focus');
+		} else {
+			this.webView?.show?.(true);
+		}
+
+		this.inProgress = true;
+		this.abortController = new AbortController();
+		this.sendMessage({ type: 'showInProgress', inProgress: this.inProgress, showStopButton: this.useGpt3 });
+		this.currentMessageId = this.getRandomId();
+
+		try {
+			if (this.useGpt3) {
+				if (this.isGpt35Model && this.apiGpt35) {
+					const gpt3Response = await this.apiGpt35.sendMessage(question, {
+						systemMessage: this.systemContext,
+						messageId: this.conversationId,
+						parentMessageId: this.messageId,
+						abortSignal: this.abortController.signal,
+						onProgress: (partialResponse) => {
+							this.response = partialResponse.text;
+							this.sendMessage({ type: 'addResponse', value: this.response, id: this.conversationId, autoScroll: this.autoScroll, responseInMarkdown });
+						},
+					});
+					({ text: this.response, id: this.conversationId, parentMessageId: this.messageId } = gpt3Response);
+				} else if (!this.isGpt35Model && this.apiGpt3) {
+					({ text: this.response, conversationId: this.conversationId, parentMessageId: this.messageId } = await this.apiGpt3.sendMessage(question, {
+						promptPrefix: this.systemContext,
+						messageId: this.conversationId,
+						parentMessageId: this.messageId,
+						abortSignal: this.abortController.signal,
+						onProgress: (partialResponse) => {
+							this.response = partialResponse.text;
+							this.sendMessage({ type: 'addResponse', value: this.response, id: this.messageId, autoScroll: this.autoScroll, responseInMarkdown });
+						},
+					}));
+				}
+			}
+
+			if (options.previousAnswer != null) {
+				this.response = options.previousAnswer + this.response;
+			}
+
+			const hasContinuation = ((this.response.split("```").length) % 2) === 1;
+
+			/*if (hasContinuation) {
+			this.response = this.response + " \r\n ```\r\n";
+			vscode.window.showInformationMessage("It looks like ChatGPT didn't complete their answer for your coding question. You can ask it to continue and combine the answers.", "Continue and combine answers")
+				.then(async (choice) => {
+					if (choice === "Continue and combine answers") {
+						this.sendApiRequest("Continue", { command: options.command, code: undefined, previousAnswer: this.response });
+					}
+				});
+			} */
+
+			this.sendMessage({ type: 'addResponse', value: this.response, done: true, id: this.currentMessageId, autoScroll: this.autoScroll, responseInMarkdown });
+
+			if (this.subscribeToResponse) {
+				vscode.window.showInformationMessage("ChatGPT responded to your question.", "Open conversation").then(async () => {
+					await vscode.commands.executeCommand('vscode-chatgpt.view.focus');
+				});
+			}
+		} catch (error: any) {
+			let message;
+			let apiMessage = error?.response?.data?.error?.message || error?.tostring?.() || error?.message || error?.name;
+
+			this.logError("api-request-failed");
+
+			if (error?.response?.status || error?.response?.statusText) {
+				message = `${error?.response?.status || ""} ${error?.response?.statusText || ""}`;
+
+				vscode.window.showErrorMessage("An error occured. If this is due to max_token you could try `ChatGPT: Clear Conversation` command and retry sending your prompt.", "Clear conversation and retry").then(async choice => {
+					if (choice === "Clear conversation and retry") {
+						await vscode.commands.executeCommand("vscode-chatgpt.clearConversation");
+						await delay(250);
+						this.sendApiRequest(prompt, { command: options.command, code: options.code });
+					}
+				});
+			} else if (error.statusCode === 400) {
+				message = `Your method: '${this.loginMethod}' and your model: '${this.model}' may be incompatible or one of your parameters is unknown. Reset your settings to default. (HTTP 400 Bad Request)`;
+
+			} else if (error.statusCode === 401) {
+				message = 'Make sure you are properly signed in. If you are using Browser Auto-login method, make sure the browser is open (You could refresh the browser tab manually if you face any issues, too). If you stored your API key in settings.json, make sure it is accurate. If you stored API key in session, you can reset it with `ChatGPT: Reset session` command. (HTTP 401 Unauthorized) Potential reasons: \r\n- 1.Invalid Authentication\r\n- 2.Incorrect API key provided.\r\n- 3.Incorrect Organization provided. \r\n See https://platform.openai.com/docs/guides/error-codes for more details.';
+			} else if (error.statusCode === 403) {
+				message = 'Your token has expired. Please try authenticating again. (HTTP 403 Forbidden)';
+			} else if (error.statusCode === 404) {
+				message = `Your method: '${this.loginMethod}' and your model: '${this.model}' may be incompatible or you may have exhausted your ChatGPT subscription allowance. (HTTP 404 Not Found)`;
+			} else if (error.statusCode === 429) {
+				message = "Too many requests try again later. (HTTP 429 Too Many Requests) Potential reasons: \r\n 1. You exceeded your current quota, please check your plan and billing details\r\n 2. You are sending requests too quickly \r\n 3. The engine is currently overloaded, please try again later. \r\n See https://platform.openai.com/docs/guides/error-codes for more details.";
+			} else if (error.statusCode === 500) {
+				message = "The server had an error while processing your request, please try again. (HTTP 500 Internal Server Error)\r\n See https://platform.openai.com/docs/guides/error-codes for more details.";
+			}
+
+			if (apiMessage) {
+				message = `${message ? message + " " : ""}${apiMessage}`;
+			}
+			this.sendMessage({ type: 'addError', value: message, autoScroll: this.autoScroll });
 			return;
 		} finally {
 			this.inProgress = false;
@@ -478,106 +716,188 @@ export default class ChatGptViewProvider implements vscode.WebviewViewProvider {
 	private getWebviewHtml(webview: vscode.Webview) {
 		const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'main.js'));
 		const stylesMainUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'main.css'));
-
 		const vendorHighlightCss = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'vendor', 'highlight.min.css'));
 		const vendorHighlightJs = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'vendor', 'highlight.min.js'));
 		const vendorMarkedJs = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'vendor', 'marked.min.js'));
 		const vendorTailwindJs = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'vendor', 'tailwindcss.3.2.4.min.js'));
 		const vendorTurndownJs = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'vendor', 'turndown.js'));
-
 		const nonce = this.getRandomId();
 
-		return `<!DOCTYPE html>
-			<html lang="en">
-			<head>
-				<meta charset="UTF-8">
-				<meta name="viewport" content="width=device-width, initial-scale=1.0" data-license="isc-gnc">
-
-				<link href="${stylesMainUri}" rel="stylesheet">
-				<link href="${vendorHighlightCss}" rel="stylesheet">
-				<script src="${vendorHighlightJs}"></script>
-				<script src="${vendorMarkedJs}"></script>
-				<script src="${vendorTailwindJs}"></script>
-				<script src="${vendorTurndownJs}"></script>
-			</head>
-			<body class="overflow-hidden">
-				<div class="flex flex-col h-screen">
-					<div id="introduction" class="flex flex-col justify-between h-full justify-center px-6 w-full relative login-screen overflow-auto">
-						<div data-license="isc-gnc-hi-there" class="flex items-start text-center features-block my-5">
-							<div class="flex flex-col gap-3.5 flex-1">
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" aria-hidden="true" class="w-6 h-6 m-auto">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"></path>
-								</svg>
-								<h2>Features</h2>
-								<ul class="flex flex-col gap-3.5 text-xs">
-									<li class="features-li w-full border border-zinc-700 p-3 rounded-md">Access to your ChatGPT conversation history</li>
-									<li class="features-li w-full border border-zinc-700 p-3 rounded-md">Improve your code, add tests & find bugs</li>
-									<li class="features-li w-full border border-zinc-700 p-3 rounded-md">Copy or create new files automatically</li>
-									<li class="features-li w-full border border-zinc-700 p-3 rounded-md">Syntax highlighting with auto language detection</li>
-								</ul>
+		return `
+		<!DOCTYPE html>
+		<html lang="en">
+		
+		<head>
+			<meta charset="UTF-8">
+			<meta name="viewport" content="width=device-width, initial-scale=1.0" data-license="isc-gnc">
+		
+			<link href="${stylesMainUri}" rel="stylesheet">
+			<link href="${vendorHighlightCss}" rel="stylesheet">
+			<script src="${vendorHighlightJs}"></script>
+			<script src="${vendorMarkedJs}"></script>
+			<script src="${vendorTailwindJs}"></script>
+			<script src="${vendorTurndownJs}"></script>
+		</head>
+		
+		<body class="overflow-hidden">
+			<div class="flex flex-col h-screen">
+				<div id="introduction"
+					class="flex flex-col justify-between h-full justify-center px-6 w-full relative login-screen overflow-auto">
+					<div data-license="isc-gnc-hi-there" class="flex items-start features-block my-5">
+						<div class="flex-col gap-3.5 gap-y-16 space-y-4 flex-1">
+							<p class="mt-2 text-3xl font-bold tracking-tight justify-items-start text-white-900 sm:text-4xl">
+								GPTer Notebook</p>
+							<p class="mt-6 text-base leading-8 text-gray-500">Elevate your Jupyter Notebook experience with our
+								VSCode extension powered by GPT, effortlessly generating code snippets and accelerating your
+								workflow.</p>
+							<p class="text-lg font-bold leading-7 text-sky-400">Features</p>
+							<div class="relative">
+								<dt class="inline font-semibold text-teal-500">
+									Seamless Integration
+								</dt>
+								<dd class="inline">Elevate your Jupyter Notebook productivity with our VSCode extension.
+									Effortlessly log in with your OpenAI API key and access ChatGPT directly from VSCode.</dd>
+							</div>
+							<div class="relative">
+								<dt class="inline font-semibold text-teal-500">
+									Effortless Code Management
+								</dt>
+								<dd class="inline">Simplify code documentation, copying, and optimization directly within your
+									workspace</dd>
+							</div>
+							<div class="relative">
+								<dt class="inline font-semibold text-teal-500">
+									Build Notebooks With No Prior Experience
+								</dt>
+								<dd class="inline">Collaboratively build notebooks from scratch! Follow the instruction, and let
+									our extension work alongside you, manipulating and guiding you step by step to create your
+									desired Jupyter Notebook</dd>
+							</div>
+							<div class="relative">
+								<dt class="inline font-semibold text-teal-500">
+									Customizable Prompts
+								</dt>
+								<dd class="inline"> Tailor your AI interaction by creating and saving personalized prompts.
+									Easily reuse them without the need to type out the entire prompt, empowering you to code
+									more efficiently and effectively.</dd>
 							</div>
 						</div>
-						<div class="flex flex-col gap-4 h-full items-center justify-end text-center">
-							<button id="login-button" class="mb-4 btn btn-primary flex gap-2 justify-center p-3 rounded-md">Log in</button>
-							<button id="list-conversations-link" class="hidden mb-4 btn btn-primary flex gap-2 justify-center p-3 rounded-md" title="You can access this feature via the kebab menu below. NOTE: Only available with Browser Auto-login method">
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 01-.825-.242m9.345-8.334a2.126 2.126 0 00-.476-.095 48.64 48.64 0 00-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0011.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" /></svg>&nbsp;Show conversations
-							</button>
-							<p class="max-w-sm text-center text-xs text-slate-500">
-								<a title="" id="settings-button" href="#">Update settings</a>&nbsp; | &nbsp;<a title="" id="settings-prompt-button" href="#">Update prompts</a>
-							</p>
-						</div>
 					</div>
-
-					<div class="flex-1 overflow-y-auto" id="qa-list" data-license="isc-gnc"></div>
-
-					<div class="flex-1 overflow-y-auto hidden" id="conversation-list" data-license="isc-gnc"></div>
-
-					<div id="in-progress" class="pl-4 pt-2 flex items-center hidden" data-license="isc-gnc">
-						<div class="typing">Thinking</div>
-						<div class="spinner">
-							<div class="bounce1"></div>
-							<div class="bounce2"></div>
-							<div class="bounce3"></div>
-						</div>
-
-						<button id="stop-button" class="btn btn-primary flex items-end p-1 pr-2 rounded-md ml-5">
-							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 mr-2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>Stop responding</button>
-					</div>
-
-					<div class="p-4 flex items-center pt-2" data-license="isc-gnc">
-						<div class="flex-1 textarea-wrapper">
-							<textarea
-								type="text"
-								rows="1" data-license="isc-gnc"
-								id="question-input"
-								placeholder="Ask a question..."
-								onInput="this.parentNode.dataset.replicatedValue = this.value"></textarea>
-						</div>
-						<div id="chat-button-wrapper" class="absolute bottom-14 items-center more-menu right-8 border border-gray-200 shadow-xl hidden text-xs" data-license="isc-gnc">
-							<button class="flex gap-2 items-center justify-start p-2 w-full" id="clear-button"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>&nbsp;New chat</button>	
-							<button class="flex gap-2 items-center justify-start p-2 w-full" id="settings-button"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>&nbsp;Update settings</button>
-							<button class="flex gap-2 items-center justify-start p-2 w-full" id="export-button"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" /></svg>&nbsp;Export to markdown</button>
-						</div>
-						<div id="question-input-buttons" class="right-6 absolute p-0.5 ml-5 flex items-center gap-2">
-							<button id="more-button" title="More actions" class="rounded-lg p-0.5" data-license="isc-gnc">
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 12.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 18.75a.75.75 0 110-1.5.75.75 0 010 1.5z" /></svg>
-							</button>
-
-							<button id="ask-button" title="Submit prompt" class="ask-button rounded-lg p-0.5">
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" /></svg>
-							</button>
-						</div>
+					<a id="notebook-guidance-button" href="#" class="hidden text-center text-sm mb-5 leading-6 text-sky-400">
+						Unleash the power of "Notebook Whisperer" - your AI guide to crafting
+						notebooks step by step from start to finish<span aria-hidden="true"> →</span></a>
+		
+					<div class="flex flex-col gap-4 h-full items-center justify-end text-center">
+						<button id="login-button" class="mb-4 btn btn-primary flex gap-2 justify-center p-3 rounded-md">Log
+							in</button>
+						<button id="list-conversations-link"
+							class="hidden mb-4 btn btn-primary flex gap-2 justify-center p-3 rounded-md"
+							title="You can access this feature via the kebab menu below. NOTE: Only available with Browser Auto-login method">
+							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+								stroke="currentColor" class="w-6 h-6">
+								<path stroke-linecap="round" stroke-linejoin="round"
+									d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 01-.825-.242m9.345-8.334a2.126 2.126 0 00-.476-.095 48.64 48.64 0 00-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0011.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" />
+							</svg>&nbsp;Show conversations
+						</button>
+						<p class="max-w-sm text-center text-xs text-slate-500">
+							<a title="" id="settings-button" href="#">Update settings</a>&nbsp; | &nbsp;<a title=""
+								id="settings-prompt-button" href="#">Update prompts</a>
+						</p>
 					</div>
 				</div>
-
-				<script nonce="${nonce}" src="${scriptUri}"></script>
-			</body>
-			</html>`;
+		
+				<div class="flex-1 overflow-y-auto" id="qa-list" data-license="isc-gnc"></div>
+				<div class="flex-1 overflow-y-auto" id="conversation-list" data-license="isc-gnc">Conversation List</div>
+		
+				<div id="in-progress" class="pl-4 pt-2 flex items-center hidden" data-license="isc-gnc">
+					<div class="typing">Thinking</div>
+					<div class="spinner">
+						<div class="bounce1"></div>
+						<div class="bounce2"></div>
+						<div class="bounce3"></div>
+					</div>
+		
+					<button id="stop-button" class="btn btn-primary flex items-end p-1 pr-2 rounded-md ml-5">
+						<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+							stroke="currentColor" class="w-5 h-5 mr-2">
+							<path stroke-linecap="round" stroke-linejoin="round"
+								d="M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+						</svg>Stop responding</button>
+				</div>
+		
+				<div class="p-4 flex items-center pt-2" data-license="isc-gnc">
+					<div id="default-question-container" class="flex-1 textarea-wrapper">
+						<textarea type="text" rows="1" data-license="isc-gnc" id="question-input"
+							placeholder="Ask a question..."
+							onInput="this.parentNode.dataset.replicatedValue = this.value"></textarea>
+					</div>
+					<div id="modified-question-container" class="flex-1 textarea-wrapper hidden">
+						<textarea type="text" rows="1" data-license="isc-gnc" id="guidance-input"
+							placeholder="Awaiting Input..."
+							onInput="this.parentNode.dataset.replicatedValue = this.value"></textarea>
+					</div>
+					<div id="chat-button-wrapper"
+						class="absolute bottom-14 items-center more-menu right-8 border border-gray-200 shadow-xl hidden text-xs"
+						data-license="isc-gnc">
+		
+						<button class="flex gap-2 items-center justify-start p-2 w-full" id="clear-button"><svg
+								xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+								stroke="currentColor" class="w-4 h-4">
+								<path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+							</svg>&nbsp;New chat</button>
+						<button class="flex gap-2 items-center justify-start p-2 w-full" id="settings-button"><svg
+								xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+								stroke="currentColor" class="w-4 h-4">
+								<path stroke-linecap="round" stroke-linejoin="round"
+									d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z" />
+								<path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+							</svg>&nbsp;Update settings</button>
+						<button class="flex gap-2 items-center justify-start p-2 w-full" id="export-button"><svg
+								xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+								stroke="currentColor" class="w-4 h-4">
+								<path stroke-linecap="round" stroke-linejoin="round"
+									d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+							</svg>&nbsp;Export to markdown</button>
+						<button class="flex gap-2 items-center justify-start p-2 w-full" id="history-button"><svg
+								xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+								stroke="currentColor" class="w-4 h-4">
+								<path d="M12 8V12L14.5 14.5" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round"
+									stroke-linejoin="round"></path>
+								<path
+									d="M7 3.33782C8.47087 2.48697 10.1786 2 12 2C17.5228 2 22 6.47715 22 12C22 17.5228 17.5228 22 12 22C6.47715 22 2 17.5228 2 12C2 10.1786 2.48697 8.47087 3.33782 7"
+									stroke="#ffffff" stroke-width="1.5" stroke-linecap="round"></path>
+							</svg>&nbsp;History</button>
+		
+					</div>
+					<div id="question-input-buttons" class="right-6 absolute p-0.5 ml-5 flex items-center gap-2">
+						<button id="more-button" title="More actions" class="rounded-lg p-0.5" data-license="isc-gnc">
+							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+								stroke="currentColor" class="w-5 h-5">
+								<path stroke-linecap="round" stroke-linejoin="round"
+									d="M12 6.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 12.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 18.75a.75.75 0 110-1.5.75.75 0 010 1.5z" />
+							</svg>
+						</button>
+		
+						<button id="ask-button" title="Submit prompt" class="ask-button rounded-lg p-0.5">
+							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+								stroke="currentColor" class="w-5 h-5">
+								<path stroke-linecap="round" stroke-linejoin="round"
+									d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
+							</svg>
+						</button>
+					</div>
+				</div>
+			</div>
+			<script nonce="${nonce}" src="${scriptUri}"></script>
+		</body>
+		
+		</html>`;
 	}
 
 	private getRandomId() {
-		let text = '';
-		const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+		let text = "";
+		const possible =
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 		for (let i = 0; i < 32; i++) {
 			text += possible.charAt(Math.floor(Math.random() * possible.length));
 		}
